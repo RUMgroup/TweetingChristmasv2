@@ -1,0 +1,298 @@
+---
+title: "Tweeting Chrismas v2"
+output:
+  html_document:
+    hightlight: tango
+    theme: united
+---
+<h2>Introduction</h2>
+Using twitter we'll try to find how people feel about Christmas.
+
+Aims: 
+Show how to access twitter APIs and show text mining of the resulting data
+Train and use a glmnet model for predicting the sentiment of tweets
+Use of leaflet to visualise the data
+
+See Paul's previous talk for good 101 on text-mining. https://github.com/RUMgroup/Text-mining
+Reka's previous talk on leaflet https://github.com/RUMgroup/leaflet_tutorial
+
+
+Load/install the other libraries needed for this work
+```{r}
+packages<-c("twitteR","streamR","ROAuth","DT","glmnet","text2vec","maps","leaflet","rgdal","raster","maptools","RColorBrewer")
+p<-sapply(packages,function(x) {
+  if (!require(x,character.only = T))
+    install.packages(x)
+    library(x,character.only = T)
+})
+
+```
+
+<h2>Collecting tweets</h2>
+
+We'll use the twitter API to access twitter data in an R friendly way.
+
+We first need to connect to the twitter API which requires an account, an registered app to generate api keys and access tokens.
+Create an app here: https://apps.twitter.com/
+
+
+```{r eval = FALSE}
+#need a dev twitter account - can make your own easily
+API_Key <- ""
+API_Secret <- ""
+Access_Token <- ""
+Access_Secret <-  ""
+
+#authenticate in headless mode
+setup_twitter_oauth(API_Key, API_Secret,Access_Token,Access_Secret)
+
+#Let's search past tweets
+#rate limited
+tweetsTrump <-searchTwitter(searchString="@realDonaldTrump",n=100,lang="en")
+
+saveRDS(tweetsTrump,file = "data/tweetsTrump.RDS")
+
+```
+
+searchTwitter returns a list of status objects contain the tweet text and meta info. 
+Reference classes look quite odd in R, more like Java/Python. They call a method from an object and are mutable.
+
+```{r}
+tweetsTrump <- readRDS("data/tweetsTrump.RDS")
+
+
+#look at the class of the first element in the returned list
+class(tweetsTrump[[1]])
+
+#take a peak at the class structure
+str(tweetsTrump[[1]])
+
+#get the screen name
+tweetsTrump[[1]]$getScreenName()
+
+#how times has it been retweeted?
+tweetsTrump[[1]]$getRetweetCount()
+
+#Get the text
+tweetsTrump[[1]]$getText()
+
+tweetsTrumpText <- sapply(tweetsTrump,function(x) x$getText())
+tweetsTrumpText <-iconv(tweetsTrumpText, "latin1", "ASCII", "")
+
+datatable(as.data.frame(tweetsTrumpText),rownames = F)
+
+```
+
+We are limited to how far we can search back and how much data we can gather.
+
+Let's listen instead - need to authenticate using ROAUTH which will open a webpage and give you a pin to enter in R
+```{r eval =F}
+requestURL <- "https://api.twitter.com/oauth/request_token"
+accessURL <- "https://api.twitter.com/oauth/access_token"
+authURL <- "https://api.twitter.com/oauth/authorize"
+
+my_oauth <- OAuthFactory$new(consumerKey=API_Key,
+                             consumerSecret=API_Secret, requestURL=requestURL,
+                             accessURL=accessURL, authURL=authURL)
+
+#should open up browser and give you a pin to type into R
+my_oauth$handshake()
+
+
+```
+
+
+<h2>Listen to tweets about Christmas</h2>
+```{r eval=FALSE}
+#Listen to all english language christmas tweets and store as json
+filterStream(file.name="tweets_keyword", track=c("Christmas","Xmas"),tweets=200000,oauth=my_oauth,language="en")
+tweets.Christmas <- parseTweets("tweets_keyword", verbose = TRUE)
+tweets.Christmas <- tweets.Christmas [!duplicated(tweets.Christmas$text),]
+saveRDS(tweets.Christmas,file="data/tweets.Christmas.RDS")
+```
+
+Look at the tweets
+```{r}
+tweets.Christmas <- readRDS("data/tweets.Christmas.RDS")
+#make sure the text is in ASCII
+tweets.Christmas$text <-iconv(tweets.Christmas$text, "latin1", "ASCII", "")
+#datatable(tweets.Christmas[1:100,],rownames = F)
+```
+<h2>Tweet Sentiment</h2>
+
+We wish to rate the tweets on happiness. This would be time consuming to do by hand so we'll use a classification model trained on 1.6 million labelled tweets to predict the sentiment.
+
+see makeSentimentModel.R for detail of how the model can be created- takes ~40 mins on single cpu
+```{r}
+#load the model
+sentimentModel <- readRDS("data/glmnet_classifier.RDS")
+
+#load the vectoriser function
+vectorizer <- readRDS("data/vectorizer.RDS")
+
+# preprocessing and tokenization
+it_tweets <- itoken(tweets.Christmas$text,
+                    preprocessor = tolower,
+                    tokenizer = word_tokenizer,
+                    progressbar = TRUE)
+
+# creating vocabulary and document-term matrix
+dtm_tweets <- create_dtm(it_tweets, vectorizer)
+
+# transforming data with tf-idf
+dtm_tweets_tfidf <- fit_transform(dtm_tweets, TfIdf$new())
+
+# predict probabilities of positiveness
+preds_tweets <- predict(sentimentModel, dtm_tweets_tfidf, type = 'response')[ ,1]
+
+# adding rates to initial dataset
+tweets.Christmas$sentiment <- preds_tweets 
+tweets.Christmas.filt <- tweets.Christmas[order(tweets.Christmas$sentiment),]
+tweets.Christmas.filt <- tweets.Christmas.filt[c(1:100,(nrow(tweets.Christmas.filt)-100):nrow(tweets.Christmas.filt)),]
+
+tweets.Christmas.filt$text <-iconv(tweets.Christmas.filt$text, "UTF-8", "ISO-8859-1", "")
+#look at the text and the sentiment
+datatable(tweets.Christmas.filt[,c("text","sentiment")],rownames = F)
+
+```
+<h2>How to people generally feel about Christmas?</h2>
+```{r}
+boxplot(tweets.Christmas$sentiment)
+```
+
+
+
+<h2>Infer the lat and long of the tweet</h2>
+```{r eval=F}
+
+#get longitude and lattidue for tweets from the location data
+data(world.cities)
+
+#modified function from - http://biostat.jhsph.edu/~jleek/code/twitterMap.R
+findLatLon <- function(loc){
+  latlon = NA
+  cont = NA
+  
+  # Asia = 1, Africa = 2, North America = 3, South America = 4, Australia/New Zealand = 5, Europe = 6
+  continents = matrix(NA,nrow=length(unique(world.cities[,2])),ncol=2)
+  continents[,1] = unique(world.cities[,2])
+  continents[1:10,2] = c(1,1,1,2,1,1,1,1,1,1)
+  continents[11:20,2]= c(1,1,2,1,1,2,1,2,2,2)
+  continents[21:30,2] = c(2,1,6,6,6,6,6,6,6,6)
+  continents[31:40,2] = c(6,6,6,6,2,4,4,1,2,1)
+  continents[41:50,2] = c(4,6,1,4,6,1,3,1,6,6)
+  continents[51:60,2] = c(3,2,4,2,6,1,6,1,3,2)
+  continents[61:70,2] = c(1,2,2,2,3,6,3,3,6,6)
+  continents[71:80,2] = c(1,1,2,6,3,4,3,4,6,1)
+  continents[81:90,2] = c(3,3,3,2,2,6,6,6,6,4)
+  continents[91:100,2] = c(2,5,2,2,3,1,1,1,1,1)
+  continents[101:110,2] = c(1,2,1,1,1,3,2,5,1,6)
+  continents[111:120,2] = c(1,6,1,1,2,6,1,1,6,2)
+  continents[121:130,2] = c(6,6,6,1,1,3,4,3,4,2)
+  continents[131:140,2] = c(6,6,2,2,1,1,1,4,1,1)
+  continents[141:150,2] = c(1,2,2,1,1,1,4,6,6,2)
+  continents[151:160,2] = c(4,1,1,1,1,2,4,6,2,2)
+  continents[161:170,2] = c(1,2,2,1,6,2,1,1,6,1)
+  continents[171:180,2] = c(1,1,1,2,6,2,2,6,1,1)
+  continents[181:190,2] = c(2,6,2,1,6,6,3,3,3,3)
+  continents[191:200,2] = c(2,2,2,2,3,2,3,2,3,1)
+  continents[201:210,2] = c(3,2,2,2,2,2,2,1,6,2)
+  continents[211:220,2] = c(1,3,1,6,2,4,3,6,3,4)
+  continents[221:230,2] = c(1,1,1,3,2,3,3,6,1,6)
+  continents[231:232,2] = c(2,1)
+  
+  
+  # Get the first element of the location
+  # firstElement = strsplit(loc,"[^[:alnum:]]")[[1]][1]
+  firstElement = strsplit(loc,",")[[1]][1]
+  if(is.na(firstElement)){firstElement="zzzzzzzzz"}
+  
+  # See if it is a city
+  tmp = grep(firstElement,world.cities[,1],fixed=TRUE)
+  tmp2 = grep(firstElement,state.name,fixed=TRUE)
+  tmp3 = grep(firstElement,world.cities[,2],fixed=TRUE)
+  
+  if(length(tmp) == 1){
+    latlon = world.cities[tmp,c(5,4)]
+    cont = continents[which(world.cities[tmp,2]==continents[,1]),2]
+  }else if(length(tmp) > 1){
+    tmpCities = world.cities[tmp,]
+    latlon = tmpCities[which.max(tmpCities$pop),c(5,4)]
+    cont = continents[which(tmpCities[which.max(tmpCities$pop),2]==continents[,1]),2]
+  }else if(length(tmp2) == 1){
+    latlon = c(state.center$x[tmp2],state.center$y[tmp2])
+    cont = 3
+  }else if(length(tmp3) > 0){
+    tmpCities = world.cities[tmp3,]
+    latlon = tmpCities[which.max(tmpCities$pop),c(5,4)]
+    cont = continents[which(tmpCities[which.max(tmpCities$pop),2]==continents[,1]),2]
+  }
+  
+  #return(list(latlon=latlon,cont=as.numeric(cont)))
+  return(latlon)
+}
+
+tweets.Christmas$location <-iconv(tweets.Christmas$location, "latin1", "ASCII", "")
+locs<-as.data.frame(tweets.Christmas$location)
+locs_lat <-apply(locs,1,findLatLon)
+saveRDS(locs_lat,"data/loc_lat.RDS")
+
+```
+
+<h2>Map the tweets locations</h2>
+```{r}
+locs_lat <- readRDS("data/loc_lat.RDS")
+tweets.Christmas$longitude <- unlist(lapply(locs_lat,"[",1))
+tweets.Christmas$latitude <- unlist(lapply(locs_lat,"[",2))
+tweets.Christmas<- tweets.Christmas[ !is.na(tweets.Christmas$longitude),]
+
+m <- leaflet(tweets.Christmas[1:500,]) %>%
+ addProviderTiles("CartoDB.Positron") %>%
+  addMarkers(lng=~longitude, lat=~latitude)
+m
+
+```
+
+<h2>Map of sentiment</h2>
+Colour each area by mean sentiment
+```{r}
+#get a shape file
+regions <- getData('GADM', country='GB', level=2)
+
+#find the intersect of the lat-long with the shapefile polygons
+
+p <- SpatialPointsDataFrame(coords = tweets.Christmas[,c("longitude","latitude")],data=data.frame(ID=paste0("tweet",1:nrow(tweets.Christmas)),sentiment=tweets.Christmas$sentiment))
+
+proj4string(p)<-CRS("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs")
+regions <- spTransform(regions, CRS("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"))
+
+#intersect
+res <- over(regions, p,returnList = T)
+
+
+#mean sentiment per polygon
+res <- lapply(res,function(x) {
+  if(nrow(x)<1){
+   return(0.5)
+  } else{
+    mean(x[,"sentiment"])
+  }})
+
+#assign the mean sentiment to the polygon
+regions$sentiment <-unlist(res)
+
+
+#What are the happy Chrimas tweeting places?
+head(regions[ order(regions$sentiment,decreasing = F),])
+
+
+#make a colour palette - purple=sad,green=happy 
+col <- colorNumeric("PiYG",domain=c(0,1))
+
+#map the shape file coloured by the mean sentiment
+m <- leaflet(regions) %>%   addProviderTiles("Stamen.Toner") %>%
+  addPolygons( stroke=F,color = ~col(sentiment))
+m
+  
+```
+
